@@ -1,0 +1,18 @@
+# Optional: lets you deploy on Render as Infrastructure-as-Code.
+# You can also just create a Web Service in the Render dashboard and set the
+# same env vars there.
+services:
+  - type: web
+    name: mt5-direct-backend
+    env: node
+    plan: starter        # "starter" (paid) stays awake; "free" sleeps and breaks live streaming
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: METAAPI_TOKEN
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT
+        sync: false
+      - key: METAAPI_REGION
+        sync: false
