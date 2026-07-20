@@ -102,9 +102,11 @@ async function discoverAccounts({ clientId, clientSecret, accessToken }) {
       const res = await s.request(PT.GET_ACCOUNTS_REQ, PT.GET_ACCOUNTS_RES, { accessToken });
       const accounts = res.ctidTraderAccount || [];
       s.close();
+      console.log('[ctrader] ' + env + ' host: app auth OK,', accounts.length, 'account(s) on token');
       if (accounts.length) return accounts;
     } catch (e) {
       s.close();
+      console.warn('[ctrader] ' + env + ' host discovery failed:', e.message);
       // try the other host before giving up
     }
   }
@@ -165,22 +167,30 @@ async function fetchAccountDeals(session, account, { uid, from, to }) {
   } catch (e) { /* names fall back to "Symbol #id" */ }
 
   const accountLabel = (account.brokerTitleShort ? account.brokerTitleShort + ' ' : '') + (account.traderLogin || ctid);
-  const MAX_ROWS = 500;
-  const MAX_PAGES = 40;
+  const MAX_ROWS = 1000;
+  // cTrader caps ProtoOADealListReq to a 1-week range per request — so walk the
+  // full [from,to] span in sub-1-week windows, paging within each window.
+  const WINDOW = 7 * 24 * 60 * 60 * 1000 - 3600000;
   const out = [];
-  let cursor = from;
-  for (let page = 0; page < MAX_PAGES; page++) {
-    const res = await session.request(PT.DEAL_LIST_REQ, PT.DEAL_LIST_RES, {
-      ctidTraderAccountId: ctid, fromTimestamp: cursor, toTimestamp: to, maxRows: MAX_ROWS,
-    });
-    const deals = (res.deal || []).filter((d) => d.closePositionDetail);
-    for (const d of deals) out.push(mapDeal(d, { uid, accountId: ctid, symbolMap, accountLabel }));
-    const all = res.deal || [];
-    if (all.length < MAX_ROWS) break; // last page
-    const maxTs = all.reduce((m, d) => Math.max(m, Number(d.executionTimestamp || d.createTimestamp || 0)), cursor);
-    if (maxTs <= cursor) break; // no progress guard
-    cursor = maxTs + 1;
+  let seen = 0;
+  for (let winStart = from; winStart < to; ) {
+    const winEnd = Math.min(winStart + WINDOW, to);
+    let cursor = winStart;
+    for (let page = 0; page < 20; page++) {
+      const res = await session.request(PT.DEAL_LIST_REQ, PT.DEAL_LIST_RES, {
+        ctidTraderAccountId: ctid, fromTimestamp: cursor, toTimestamp: winEnd, maxRows: MAX_ROWS,
+      });
+      const all = res.deal || [];
+      seen += all.length;
+      for (const d of all) if (d.closePositionDetail) out.push(mapDeal(d, { uid, accountId: ctid, symbolMap, accountLabel }));
+      if (all.length < MAX_ROWS) break;
+      const maxTs = all.reduce((m, d) => Math.max(m, Number(d.executionTimestamp || d.createTimestamp || 0)), cursor);
+      if (maxTs <= cursor) break;
+      cursor = maxTs + 1;
+    }
+    winStart = winEnd;
   }
+  console.log('[ctrader] account', ctid, '(' + accountLabel + '):', seen, 'deals seen,', out.length, 'closed trades mapped');
   return { trades: out, accountLabel, ctid, isLive: !!account.isLive };
 }
 
@@ -188,8 +198,9 @@ async function fetchAccountDeals(session, account, { uid, from, to }) {
 // Returns { accounts:[{accountId,label,live}], trades:[...] }.
 async function fetchClosedTrades({ uid, clientId, clientSecret, accessToken, from, to }) {
   const accounts = await discoverAccounts({ clientId, clientSecret, accessToken });
-  if (!accounts.length) return { accounts: [], trades: [] };
+  if (!accounts.length) { console.warn('[ctrader] no accounts found on token — nothing to sync'); return { accounts: [], trades: [] }; }
   accounts.forEach((a) => { a._accessToken = accessToken; });
+  console.log('[ctrader] syncing', accounts.length, 'account(s), window', new Date(from).toISOString(), '->', new Date(to).toISOString());
 
   const byEnv = { live: [], demo: [] };
   for (const a of accounts) (a.isLive ? byEnv.live : byEnv.demo).push(a);
@@ -218,6 +229,7 @@ async function fetchClosedTrades({ uid, clientId, clientSecret, accessToken, fro
     }
   }
   allTrades.sort((a, b) => a.tradeDate - b.tradeDate);
+  console.log('[ctrader] total closed trades fetched across accounts:', allTrades.length);
   return { accounts: accountMeta, trades: allTrades };
 }
 
