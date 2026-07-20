@@ -43,14 +43,23 @@ class CtSession {
       const ws = new WebSocket(endpoint(this.env));
       this.ws = ws;
       const t = setTimeout(() => { try { ws.terminate(); } catch (e) {} reject(new Error('Could not reach cTrader Open API.')); }, timeoutMs);
-      ws.on('open', () => { clearTimeout(t); resolve(); });
+      ws.on('open', () => { clearTimeout(t); this._startHeartbeat(); resolve(); });
       ws.on('error', (e) => { clearTimeout(t); reject(new Error('cTrader WebSocket connection failed: ' + (e && e.message || e))); });
       ws.on('message', (data) => this._onMessage(data));
       ws.on('close', () => {
+        this._stopHeartbeat();
         for (const w of this.waiters.splice(0)) { clearTimeout(w.timer); w.reject(new Error('cTrader socket closed.')); }
       });
     });
   }
+  _startHeartbeat() {
+    this._stopHeartbeat();
+    // cTrader drops idle sockets (~10s) — keep it alive across the backfill.
+    this.hb = setInterval(() => {
+      try { if (this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify({ clientMsgId: 'hb', payloadType: PT.HEARTBEAT, payload: {} })); } catch (e) {}
+    }, 10000);
+  }
+  _stopHeartbeat() { if (this.hb) { clearInterval(this.hb); this.hb = null; } }
   _onMessage(data) {
     let msg;
     try { msg = JSON.parse(data.toString()); } catch (e) { return; }
@@ -88,8 +97,13 @@ class CtSession {
     this.send(PT.APP_AUTH_REQ, { clientId, clientSecret });
     await this.wait(PT.APP_AUTH_RES);
   }
-  close() { try { if (this.ws) this.ws.close(); } catch (e) {} }
+  close() { this._stopHeartbeat(); try { if (this.ws) this.ws.close(); } catch (e) {} }
 }
+
+// Per-account symbol-name cache so we don't re-download the full symbol list on
+// every 3-min poll (it's a large payload). { ctid: { map, ts } }.
+const SYMBOL_CACHE = {};
+const SYMBOL_TTL = 24 * 60 * 60 * 1000;
 
 // Discover every ctidTraderAccount linked to this access token (isLive flag included).
 async function discoverAccounts({ clientId, clientSecret, accessToken }) {
@@ -157,14 +171,22 @@ async function fetchAccountDeals(session, account, { uid, from, to }) {
   session.send(PT.ACCOUNT_AUTH_REQ, { ctidTraderAccountId: ctid, accessToken: account._accessToken });
   await session.wait(PT.ACCOUNT_AUTH_RES);
 
-  // symbolId -> name map
-  const symbolMap = {};
-  try {
-    const sym = await session.request(PT.SYMBOLS_LIST_REQ, PT.SYMBOLS_LIST_RES, { ctidTraderAccountId: ctid, includeArchivedSymbols: true });
-    (sym.symbol || sym.lightSymbol || []).forEach((s) => {
-      symbolMap[String(s.symbolId)] = s.symbolName || s.name || s.displayName || String(s.symbolId);
-    });
-  } catch (e) { /* names fall back to "Symbol #id" */ }
+  // symbolId -> name map (cached 24h per account to avoid re-downloading the full
+  // symbol list on every poll — the biggest per-sync cost).
+  let symbolMap;
+  const cached = SYMBOL_CACHE[ctid];
+  if (cached && (Date.now() - cached.ts) < SYMBOL_TTL && Object.keys(cached.map).length) {
+    symbolMap = cached.map;
+  } else {
+    symbolMap = {};
+    try {
+      const sym = await session.request(PT.SYMBOLS_LIST_REQ, PT.SYMBOLS_LIST_RES, { ctidTraderAccountId: ctid, includeArchivedSymbols: true });
+      (sym.symbol || sym.lightSymbol || []).forEach((s) => {
+        symbolMap[String(s.symbolId)] = s.symbolName || s.name || s.displayName || String(s.symbolId);
+      });
+      SYMBOL_CACHE[ctid] = { map: symbolMap, ts: Date.now() };
+    } catch (e) { /* names fall back to "Symbol #id" */ }
+  }
 
   const accountLabel = (account.brokerTitleShort ? account.brokerTitleShort + ' ' : '') + (account.traderLogin || ctid);
   const MAX_ROWS = 1000;
@@ -197,6 +219,7 @@ async function fetchAccountDeals(session, account, { uid, from, to }) {
 // Top-level: discover accounts, then pull deals per account grouped by env host.
 // Returns { accounts:[{accountId,label,live}], trades:[...] }.
 async function fetchClosedTrades({ uid, clientId, clientSecret, accessToken, from, to }) {
+  const t0 = Date.now();
   const accounts = await discoverAccounts({ clientId, clientSecret, accessToken });
   if (!accounts.length) { console.warn('[ctrader] no accounts found on token — nothing to sync'); return { accounts: [], trades: [] }; }
   accounts.forEach((a) => { a._accessToken = accessToken; });
@@ -229,7 +252,7 @@ async function fetchClosedTrades({ uid, clientId, clientSecret, accessToken, fro
     }
   }
   allTrades.sort((a, b) => a.tradeDate - b.tradeDate);
-  console.log('[ctrader] total closed trades fetched across accounts:', allTrades.length);
+  console.log('[ctrader] total closed trades fetched across accounts:', allTrades.length, 'in', ((Date.now() - t0) / 1000).toFixed(1) + 's');
   return { accounts: accountMeta, trades: allTrades };
 }
 
