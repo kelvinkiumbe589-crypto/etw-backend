@@ -33,10 +33,12 @@ function configured() { return !!(CLIENT_ID && CLIENT_SECRET && REDIRECT_URI); }
 const setStatus = (uid, patch) => store.setStatus(uid, STATUS_KEY, patch);
 
 // Step 1 — build the authorize URL the user is sent to.
-function createAuthUrl(uid) {
+// journalAccountId = the ETW journal profile the imported trades should belong to
+// (mirrors TradeLocker/DXtrade). Threaded through OAuth state so the callback can tag trades.
+function createAuthUrl(uid, journalAccountId) {
   if (!configured()) throw new Error('cTrader is not configured (set CTRADER_CLIENT_ID / SECRET / REDIRECT_URI).');
   const state = crypto.randomBytes(16).toString('hex');
-  pendingStates.set(state, { uid, ts: Date.now() });
+  pendingStates.set(state, { uid, journalAccountId: journalAccountId || '', ts: Date.now() });
   for (const [k, v] of pendingStates) if (Date.now() - v.ts > 600000) pendingStates.delete(k); // prune >10 min
   const p = new URLSearchParams({
     client_id: CLIENT_ID,
@@ -115,10 +117,13 @@ async function ensureToken(uid) {
 }
 
 // Pull closed deals and write new ones. backfill=true widens the window to 90 days.
-async function syncUser(uid, { backfill } = {}) {
+async function syncUser(uid, { backfill, journalAccountId } = {}) {
   const t = await ensureToken(uid);
   const statusSnap = await store.db.collection('users').doc(uid).get();
   const status = (statusSnap.exists && statusSnap.data()[STATUS_KEY]) || {};
+  // Which ETW journal profile these trades belong to. Prefer the value captured at
+  // connect time; fall back to what's stored on the status doc; default to '' (= default profile).
+  const jid = (journalAccountId != null ? journalAccountId : (status.journalAccountId || '')) || '';
   const now = Date.now();
   const from = backfill
     ? now - 90 * 86400000
@@ -128,30 +133,25 @@ async function syncUser(uid, { backfill } = {}) {
     uid, clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, accessToken: t.accessToken, from, to: now,
   });
 
-  // Dedup per account against already-stored tickets, then batch-write the rest.
-  let written = 0;
-  const byAccount = new Map();
-  for (const tr of trades) {
-    const k = tr.accountId || '';
-    if (!byAccount.has(k)) byAccount.set(k, []);
-    byAccount.get(k).push(tr);
-  }
-  for (const [accId, list] of byAccount) {
-    const existing = await store.existingTickets(uid, 'ctrader_open_api', accId);
-    const fresh = list.filter((tr) => !existing.has(String(tr.ticket)));
-    if (fresh.length) written += await store.writeTrades(fresh);
-  }
+  // All cTrader trades are tagged with the chosen journal profile so the frontend's
+  // per-account filter shows them (the cTrader account number stays in brokerAccount).
+  trades.forEach((tr) => { tr.accountId = jid; });
+
+  const existing = await store.existingTickets(uid, 'ctrader_open_api', jid);
+  const fresh = trades.filter((tr) => !existing.has(String(tr.ticket)));
+  const written = fresh.length ? await store.writeTrades(fresh) : 0;
 
   await setStatus(uid, {
     status: 'connected',
     accounts,
+    journalAccountId: jid,
     historyImported: Number(status.historyImported || 0) + written,
     lastSyncAt: now,
     lastDealSyncAt: now - 60000,
     note: null,
     error: null,
   });
-  if (written) console.log('ctrader: wrote', written, 'new trade(s) for', uid);
+  if (written) console.log('ctrader: wrote', written, 'new trade(s) for', uid, 'profile', jid || '(default)');
   return written;
 }
 
@@ -161,12 +161,13 @@ async function handleCallback(code, state) {
   if (!rec) throw new Error('Invalid or expired OAuth state.');
   pendingStates.delete(state);
   const uid = rec.uid;
-  await setStatus(uid, { status: 'connecting', error: null });
+  const journalAccountId = rec.journalAccountId || '';
+  await setStatus(uid, { status: 'connecting', error: null, journalAccountId });
   const tok = await exchangeToken(code);   // fail fast if the code is bad
   await saveTokens(uid, tok);
   // Backfill runs in the background so the popup can close immediately; the
   // frontend watches the status doc and flips to "connected" when it finishes.
-  syncUser(uid, { backfill: true }).catch(async (e) => {
+  syncUser(uid, { backfill: true, journalAccountId }).catch(async (e) => {
     console.error('ctrader initial sync failed for', uid, '-', e.message);
     await setStatus(uid, { status: 'error', error: friendlyError(e) }).catch(() => {});
   });

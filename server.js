@@ -111,7 +111,7 @@ app.post('/api/dxtrade/disconnect', requireAuth, async (req, res) => {
 
 // ── cTrader (OAuth) ────────────────────────────────────────
 app.get('/api/ctrader/auth', requireAuth, async (req, res) => {
-  try { res.json({ ok: true, url: ctrader.createAuthUrl(req.uid) }); }
+  try { res.json({ ok: true, url: ctrader.createAuthUrl(req.uid, (req.query && req.query.journalAccountId) || '') }); }
   catch (e) { res.status(400).json({ error: ctrader.friendlyError(e) }); }
 });
 app.get('/api/ctrader/callback', async (req, res) => {
