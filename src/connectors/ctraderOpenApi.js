@@ -165,16 +165,23 @@ function mapDeal(d, { uid, accountId, symbolMap, accountLabel }) {
   // We import the CLOSING deal; its side is opposite the position's direction
   // (a long is closed by a SELL, a short by a BUY) — so invert it.
   const positionDir = side(d.tradeSide || tradeData.tradeSide) === 'LONG' ? 'SHORT' : 'LONG';
+  const result = p > 0 ? 'WIN' : p < 0 ? 'LOSS' : 'BREAKEVEN';
+  // The closing deal's execution price is the realized exit. Record it as the
+  // take-profit on a win and the stop-loss on a loss; a breakeven keeps only the
+  // entry (both blank). cTrader's deal history does not carry the originally-set
+  // SL/TP order levels, so this reflects the actual price the position closed at.
+  const exitPrice = d.executionPrice != null ? String(d.executionPrice) : '';
   return {
     uid,
     pair: symbolName,
     direction: positionDir,
     entry: close.entryPrice != null ? String(close.entryPrice) : '',
-    closePrice: d.executionPrice != null ? String(d.executionPrice) : '',
-    sl: '', tp: '',
+    closePrice: exitPrice,
+    sl: result === 'LOSS' ? exitPrice : '',
+    tp: result === 'WIN' ? exitPrice : '',
     lot: String(r2(lot)),
     pnl: p,
-    result: p > 0 ? 'WIN' : p < 0 ? 'LOSS' : 'BREAKEVEN',
+    result,
     tradeDate: openMs,
     closeTime: new Date(openMs).toISOString(),
     swap: r2(swap),
