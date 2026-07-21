@@ -22,6 +22,7 @@ const tradelocker = require('./src/connectors/tradelocker');
 const dxtrade = require('./src/connectors/dxtrade');
 const ctrader = require('./src/connectors/ctrader');
 const mt5ea = require('./src/connectors/mt5ea');
+const email = require('./src/email');
 
 initFirebase();
 const db = admin.firestore();
@@ -180,6 +181,72 @@ app.get('/api/market/twelvedata', marketLimiter, async (req, res) => {
     const data = await r.json().catch(() => ({}));
     res.status(r.status).json(data);
   } catch (e) { console.error('twelvedata proxy:', e.message); res.status(502).json({ error: 'Market-data upstream error.' }); }
+});
+
+// ── New-device sign-in alert ───────────────────────────────
+// The client pings this on login with its persistent deviceId. We keep a
+// server-only record of known devices (users/{uid}/private/knownDevices) and
+// email the account the first time a new device appears. The very first device
+// (account creation) is recorded silently. Emails require BREVO_* env vars;
+// without them this records devices but sends nothing.
+function friendlyDevice(ua) {
+  ua = String(ua || '');
+  const br = /edg/i.test(ua) ? 'Edge'
+    : /(chrome|crios)/i.test(ua) ? 'Chrome'
+    : /(firefox|fxios)/i.test(ua) ? 'Firefox'
+    : /safari/i.test(ua) ? 'Safari' : 'Browser';
+  const os = /windows/i.test(ua) ? 'Windows'
+    : /android/i.test(ua) ? 'Android'
+    : /(iphone|ipad|ios)/i.test(ua) ? 'iOS'
+    : /mac os/i.test(ua) ? 'macOS'
+    : /linux/i.test(ua) ? 'Linux' : 'device';
+  return br + ' on ' + os;
+}
+function escapeHtml(s) {
+  return String(s || '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+app.post('/api/auth/login-alert', authLimiter, requireAuth, async (req, res) => {
+  res.json({ ok: true });   // respond immediately; do the work in the background
+  try {
+    const deviceId = (req.body && req.body.deviceId) || '';
+    const userAgent = (req.body && req.body.userAgent) || '';
+    if (!deviceId) return;
+    const ref = admin.firestore().collection('users').doc(req.uid).collection('private').doc('knownDevices');
+    const snap = await ref.get();
+    const known = (snap.exists && snap.data()) || {};
+    if (known[deviceId]) return;                       // already seen — no alert
+
+    const ip = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim() || (req.socket && req.socket.remoteAddress) || '';
+    let loc = '';
+    try {
+      const g = await (await fetch('https://ipwho.is/' + encodeURIComponent(ip))).json();
+      if (g && g.success) loc = [g.city, g.country].filter(Boolean).join(', ');
+    } catch (e) {}
+
+    const firstEver = Object.keys(known).length === 0;
+    await ref.set({ [deviceId]: { firstSeen: Date.now(), ua: String(userAgent).slice(0, 200), ip, loc } }, { merge: true });
+    if (firstEver) return;                             // don't alert on the very first (signup) device
+
+    const user = await admin.auth().getUser(req.uid).catch(() => null);
+    if (!user || !user.email) return;
+    await email.sendEmail({
+      to: user.email,
+      toName: user.displayName || '',
+      subject: 'New sign-in to your ETW Journal account',
+      html: `<div style="font-family:system-ui,-apple-system,sans-serif;max-width:480px;margin:auto;color:#1a1a1a">
+        <h2 style="margin:0 0 12px">New sign-in detected</h2>
+        <p>Your ETW Journal account was just signed in on a new device:</p>
+        <table style="border-collapse:collapse;margin:12px 0">
+          <tr><td style="padding:4px 12px 4px 0;color:#666">Device</td><td style="padding:4px 0"><b>${escapeHtml(friendlyDevice(userAgent))}</b></td></tr>
+          <tr><td style="padding:4px 12px 4px 0;color:#666">Location</td><td style="padding:4px 0"><b>${escapeHtml(loc || 'Unknown')}</b></td></tr>
+          <tr><td style="padding:4px 12px 4px 0;color:#666">Time</td><td style="padding:4px 0"><b>${new Date().toUTCString()}</b></td></tr>
+        </table>
+        <p>If this was you, no action is needed.</p>
+        <p><b>If this wasn't you</b>, reset your password immediately from the login page and review your account.</p>
+        <p style="color:#999;font-size:12px;margin-top:20px">ETW Journal security</p>
+      </div>`,
+    });
+  } catch (e) { console.error('login-alert:', e.message); }
 });
 
 const port = process.env.PORT || 8080;
