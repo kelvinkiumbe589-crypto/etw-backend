@@ -1,0 +1,121 @@
+rules_version = '2';
+
+// ETW Journal — Firestore security rules.
+// Principle: every user can only touch their own data; server-only data
+// (OAuth tokens, EA keys) is never client-readable; the backend uses the
+// Admin SDK which BYPASSES these rules, so all server writes keep working.
+// Anything not matched below is denied by default.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── helpers ─────────────────────────────────────────────
+    function isSignedIn() { return request.auth != null; }
+    function isOwner(uid) { return isSignedIn() && request.auth.uid == uid; }
+    function isAdmin() {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+    // Mentor/student relationship doc id is "<mentorUid>_<studentUid>".
+    // Firebase UIDs contain no underscores, so split('_') is safe.
+    function hasMentorLink(otherUid) {
+      return isSignedIn() && (
+        exists(/databases/$(database)/documents/mentorRelationships/$(request.auth.uid + '_' + otherUid)) ||
+        exists(/databases/$(database)/documents/mentorRelationships/$(otherUid + '_' + request.auth.uid))
+      );
+    }
+
+    // ── users + subcollections ──────────────────────────────
+    match /users/{uid} {
+      allow read:  if isOwner(uid) || isAdmin();
+      allow write: if isOwner(uid);   // profile/settings; backend broker-status writes use Admin SDK (bypass rules)
+
+      // cTrader OAuth access/refresh tokens — SERVER ONLY. Never exposed to clients.
+      match /private/{doc=**} { allow read, write: if false; }
+
+      // 2-device-limit registry
+      match /devices/{deviceId} { allow read, write: if isOwner(uid); }
+
+      // notebook + account profiles
+      match /notes/{id}       { allow read, write: if isOwner(uid); }
+      match /noteFolders/{id} { allow read, write: if isOwner(uid); }
+      match /accounts/{id}    { allow read, write: if isOwner(uid); }
+    }
+
+    // ── trades (each doc carries a uid field) ────────────────
+    match /trades/{id} {
+      allow create: if isSignedIn() && request.resource.data.uid == request.auth.uid;
+      allow read:   if isSignedIn() && (resource.data.uid == request.auth.uid || hasMentorLink(resource.data.uid) || isAdmin());
+      allow update, delete: if isSignedIn() && resource.data.uid == request.auth.uid;
+      // Broker-sync imports are written by the backend Admin SDK (bypass rules).
+    }
+
+    // ── playbooks (uid field) ────────────────────────────────
+    match /playbooks/{id} {
+      allow create: if isSignedIn() && request.resource.data.uid == request.auth.uid;
+      allow read:   if isSignedIn() && (resource.data.uid == request.auth.uid || hasMentorLink(resource.data.uid) || isAdmin());
+      allow update, delete: if isSignedIn() && resource.data.uid == request.auth.uid;
+    }
+
+    // ── support tickets (signed-in users, unauthenticated guests, admins) ──
+    match /supportTickets/{id} {
+      allow create: if (isSignedIn() && request.resource.data.uid == request.auth.uid)
+                    || request.resource.data.uid == 'guest';
+      allow read, update: if isAdmin()
+                    || (isSignedIn() && resource.data.uid == request.auth.uid)
+                    || resource.data.uid == 'guest';
+      allow delete: if isAdmin();
+
+      match /messages/{msgId} {
+        function ticketUid() { return get(/databases/$(database)/documents/supportTickets/$(id)).data.uid; }
+        allow read, create: if isAdmin()
+                    || (isSignedIn() && ticketUid() == request.auth.uid)
+                    || ticketUid() == 'guest';
+      }
+    }
+
+    // ── admins (read own status; managed manually in the console) ──
+    match /admins/{uid} {
+      allow read:  if isSignedIn();
+      allow write: if false;
+    }
+
+    // ── public shares (public read by link; owner writes) ────
+    match /publicShares/{shareId} {
+      allow read:   if true;   // shared journal pages are public by design
+      allow create: if isSignedIn() && request.resource.data.uid == request.auth.uid;
+      allow update, delete: if isSignedIn() && resource.data.uid == request.auth.uid;
+    }
+    // likes/comments on public share pages (viewers may be unauthenticated)
+    match /publicInteractions/{shareId}/{rest=**} {
+      allow read, create: if true;
+      allow update, delete: if false;
+    }
+
+    // ── presence ─────────────────────────────────────────────
+    match /presence/{uid} {
+      allow read:  if isSignedIn();
+      allow write: if isOwner(uid);
+    }
+
+    // ── tips (client creates; only admins read) ──────────────
+    match /tips/{id} {
+      allow create: if isSignedIn();
+      allow read:   if isAdmin();
+      allow update, delete: if false;
+    }
+
+    // ── mentor relationships + chat (both parties; id "<mentor>_<student>") ──
+    match /mentorRelationships/{relId} {
+      allow read, write: if isSignedIn() &&
+        (request.auth.uid == relId.split('_')[0] || request.auth.uid == relId.split('_')[1]);
+    }
+    match /mentorChat/{relId}/messages/{msgId} {
+      allow read, write: if isSignedIn() &&
+        (request.auth.uid == relId.split('_')[0] || request.auth.uid == relId.split('_')[1]);
+    }
+
+    // ── EA keys (secret key = doc id) — SERVER ONLY ──────────
+    match /eaKeys/{key} { allow read, write: if false; }
+  }
+}
