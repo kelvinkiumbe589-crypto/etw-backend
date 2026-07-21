@@ -116,7 +116,11 @@ async function ensureToken(uid) {
   return t;
 }
 
-// Pull closed deals and write new ones. backfill=true widens the window to 90 days.
+// Pull closed deals and write new ones.
+// The 90-day backfill keeps running (on every poll) until it completes without
+// errors — so a rate-limited/partial backfill self-heals instead of leaving a
+// permanent gap. Only once a backfill fully succeeds do we switch to the light
+// 7-day incremental window, and we only advance the cursor when the sync is clean.
 async function syncUser(uid, { backfill, journalAccountId } = {}) {
   const t = await ensureToken(uid);
   const statusSnap = await store.db.collection('users').doc(uid).get();
@@ -125,11 +129,12 @@ async function syncUser(uid, { backfill, journalAccountId } = {}) {
   // connect time; fall back to what's stored on the status doc; default to '' (= default profile).
   const jid = (journalAccountId != null ? journalAccountId : (status.journalAccountId || '')) || '';
   const now = Date.now();
-  const from = backfill
+  const doBackfill = backfill || status.backfillDone !== true;
+  const from = doBackfill
     ? now - 90 * 86400000
     : Math.max(Number(status.lastDealSyncAt || 0), now - 7 * 86400000);
 
-  const { accounts, trades } = await engine.fetchClosedTrades({
+  const { accounts, trades, ok } = await engine.fetchClosedTrades({
     uid, clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, accessToken: t.accessToken, from, to: now,
   });
 
@@ -141,17 +146,25 @@ async function syncUser(uid, { backfill, journalAccountId } = {}) {
   const fresh = trades.filter((tr) => !existing.has(String(tr.ticket)));
   const written = fresh.length ? await store.writeTrades(fresh) : 0;
 
-  await setStatus(uid, {
+  const patch = {
     status: 'connected',
     accounts,
     journalAccountId: jid,
     historyImported: Number(status.historyImported || 0) + written,
     lastSyncAt: now,
-    lastDealSyncAt: now - 60000,
     note: null,
     error: null,
-  });
+  };
+  // Only advance the cursor / mark backfill done when the pull was COMPLETE.
+  // If it failed (e.g. rate-limited), leave them so the next poll retries the
+  // same window instead of skipping past missed deals.
+  if (ok) {
+    patch.lastDealSyncAt = now - 60000;
+    if (doBackfill) patch.backfillDone = true;
+  }
+  await setStatus(uid, patch);
   if (written) console.log('ctrader: wrote', written, 'new trade(s) for', uid, 'profile', jid || '(default)');
+  else if (!ok) console.log('ctrader: sync incomplete for', uid, '— will retry on next poll');
   return written;
 }
 

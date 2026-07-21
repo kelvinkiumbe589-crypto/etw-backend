@@ -246,8 +246,9 @@ async function fetchAccountDeals(session, account, { uid, from, to }) {
 // Returns { accounts:[{accountId,label,live}], trades:[...] }.
 async function fetchClosedTrades({ uid, clientId, clientSecret, accessToken, from, to }) {
   const t0 = Date.now();
+  let ok = true; // false if any account/window failed — caller must NOT advance the sync cursor
   const accounts = await discoverAccounts({ clientId, clientSecret, accessToken });
-  if (!accounts.length) { console.warn('[ctrader] no accounts found on token — nothing to sync'); return { accounts: [], trades: [] }; }
+  if (!accounts.length) { console.warn('[ctrader] no accounts found on token — nothing to sync (will retry)'); return { accounts: [], trades: [], ok: false }; }
   accounts.forEach((a) => { a._accessToken = accessToken; });
   console.log('[ctrader] syncing', accounts.length, 'account(s), window', new Date(from).toISOString(), '->', new Date(to).toISOString());
 
@@ -268,18 +269,20 @@ async function fetchClosedTrades({ uid, clientId, clientSecret, accessToken, fro
           allTrades.push(...r.trades);
           accountMeta.push({ accountId: String(r.ctid), label: r.accountLabel, live: r.isLive });
         } catch (e) {
+          ok = false;
           console.error('ctrader account sync failed', acc.ctidTraderAccountId, '-', e.message);
         }
       }
     } catch (e) {
+      ok = false;
       console.error('ctrader ' + env + ' session failed:', e.message);
     } finally {
       session.close();
     }
   }
   allTrades.sort((a, b) => a.tradeDate - b.tradeDate);
-  console.log('[ctrader] total closed trades fetched across accounts:', allTrades.length, 'in', ((Date.now() - t0) / 1000).toFixed(1) + 's');
-  return { accounts: accountMeta, trades: allTrades };
+  console.log('[ctrader] total closed trades fetched across accounts:', allTrades.length, 'in', ((Date.now() - t0) / 1000).toFixed(1) + 's', ok ? '(complete)' : '(INCOMPLETE — will retry)');
+  return { accounts: accountMeta, trades: allTrades, ok };
 }
 
 module.exports = { fetchClosedTrades, discoverAccounts, mapDeal, PT };
