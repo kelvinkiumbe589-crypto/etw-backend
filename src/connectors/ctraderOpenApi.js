@@ -214,6 +214,9 @@ function mapDeal(d, { uid, accountId, symbolMap, lotSizeMap, accountLabel }) {
     pnl: p,
     result,
     tradeDate: openMs,
+    // Position open time (from the deal's tradeData) — used by Trade Replay to place
+    // the entry marker; the closing deal's executionTimestamp is the exit time.
+    openTime: tradeData.openTimestamp ? Number(tradeData.openTimestamp) : '',
     closeTime: new Date(openMs).toISOString(),
     swap: r2(swap),
     commission: r2(commission),
