@@ -29,6 +29,29 @@ function side(v) {
   const s = String(v).toUpperCase();
   return (s === '1' || s === 'BUY') ? 'LONG' : 'SHORT';
 }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// App-wide throttle for ProtoOADealListReq. cTrader rate-limits historical
+// requests ("BLOCKED_PAYLOAD_TYPE: You are being rate limited"), and with many
+// users + the 90-day backfill firing ~13 requests each, bursts get blocked.
+// Serialize ALL deal-list calls across users with a ~300ms gap, and retry with
+// backoff on a rate-limit error so the backfill completes instead of failing.
+let _dlGate = Promise.resolve();
+function throttledDealList(session, payload) {
+  const run = async () => {
+    for (let attempt = 0; ; attempt++) {
+      try { return await session.request(PT.DEAL_LIST_REQ, PT.DEAL_LIST_RES, payload, 25000); }
+      catch (e) {
+        const m = (e && e.message) || '';
+        if (/rate limit|BLOCKED_PAYLOAD_TYPE|too many/i.test(m) && attempt < 6) { await sleep(2000 * (attempt + 1)); continue; }
+        throw e;
+      }
+    }
+  };
+  const result = _dlGate.then(run, run); // run after the previous call settles (ok or error)
+  _dlGate = result.catch(() => {}).then(() => sleep(300)); // ~3 requests/sec app-wide
+  return result;
+}
 
 // ── A single JSON-WebSocket session against one cTrader host ──────────────
 class CtSession {
@@ -202,7 +225,7 @@ async function fetchAccountDeals(session, account, { uid, from, to }) {
     const winEnd = Math.min(winStart + WINDOW, to);
     let cursor = winStart;
     for (let page = 0; page < 20; page++) {
-      const res = await session.request(PT.DEAL_LIST_REQ, PT.DEAL_LIST_RES, {
+      const res = await throttledDealList(session, {
         ctidTraderAccountId: ctid, fromTimestamp: cursor, toTimestamp: winEnd, maxRows: MAX_ROWS,
       });
       const all = res.deal || [];
