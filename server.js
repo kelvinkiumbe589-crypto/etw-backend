@@ -245,6 +245,30 @@ app.get('/api/market/cache-stats', (req, res) => {
   });
 });
 
+// ── Broker-native candles from cTrader (trendbars) ─────────
+// Returns the user's own broker candles so Trade Replay / Backtesting line up with
+// their fills (vs Twelve Data/Binance which can differ for OTC forex/metals).
+// Requires the caller to be signed in AND to have a connected cTrader account.
+app.get('/api/market/ctrader-bars', marketLimiter, requireAuth, async (req, res) => {
+  if (!ctrader.configured()) return res.status(503).json({ error: 'cTrader is not configured on the server.' });
+  const q = req.query || {};
+  if (!q.symbol || !q.tf) return res.status(400).json({ error: 'symbol and tf are required' });
+  const from = Number(q.from) || 0, to = Number(q.to) || Date.now();
+  const cacheKey = 'ctb:' + req.uid + ':' + (q.accountId || '') + ':' + q.symbol + ':' + q.tf + ':' + from + ':' + to;
+  const hit = mktGet(cacheKey);
+  if (hit) { MKT_HITS++; res.set('X-Cache', 'HIT'); return res.status(hit.status).type('application/json').send(hit.body); }
+  MKT_MISS++;
+  try {
+    const bars = await ctrader.getBars(req.uid, { symbol: q.symbol, tf: q.tf, from, to, accountId: q.accountId || '' });
+    const body = JSON.stringify({ candles: bars || [] });
+    if (bars && bars.length) {
+      const isPast = to && to < Date.now() - 2 * 60 * 1000;
+      mktSet(cacheKey, body, 200, isPast ? 30 * 24 * 3600 * 1000 : 60 * 1000);
+    }
+    res.set('X-Cache', 'MISS'); res.type('application/json').send(body);
+  } catch (e) { console.error('ctrader-bars:', e.message); res.status(502).json({ error: 'cTrader bars error: ' + e.message }); }
+});
+
 // ── New-device sign-in alert ───────────────────────────────
 // The client pings this on login with its persistent deviceId. We keep a
 // server-only record of known devices (users/{uid}/private/knownDevices) and

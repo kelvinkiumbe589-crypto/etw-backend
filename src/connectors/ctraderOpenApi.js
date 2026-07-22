@@ -12,6 +12,7 @@ const PT = {
   SYMBOLS_LIST_REQ: 2114, SYMBOLS_LIST_RES: 2115,
   SYMBOL_BY_ID_REQ: 2116, SYMBOL_BY_ID_RES: 2117,
   DEAL_LIST_REQ: 2133, DEAL_LIST_RES: 2134,
+  TRENDBARS_REQ: 2137, TRENDBARS_RES: 2138,
   ERROR_RES: 2142, GET_ACCOUNTS_REQ: 2149, GET_ACCOUNTS_RES: 2150,
 };
 
@@ -335,4 +336,52 @@ async function fetchClosedTrades({ uid, clientId, clientSecret, accessToken, fro
   return { accounts: accountMeta, trades: allTrades, ok };
 }
 
-module.exports = { fetchClosedTrades, discoverAccounts, mapDeal, PT };
+// ── Broker-native candles (trendbars) for Trade Replay / Backtesting ──────────
+// cTrader trendbars encode prices as deltas from `low`, all scaled ×10^5, and the
+// bar's open time as utcTimestampInMinutes. We divide by 10^5 so candles line up
+// with the deal (entry/exit) prices, which are already in real units.
+const TB_PERIOD = { '1':1, '2':2, '3':3, '4':4, '5':5, '10':6, '15':7, '30':8, '60':9, '240':10, '720':11, 'D':12, 'W':13, 'M':14 };
+async function resolveSymbolId(session, ctid, symbolName) {
+  const res = await session.request(PT.SYMBOLS_LIST_REQ, PT.SYMBOLS_LIST_RES, { ctidTraderAccountId: ctid, includeArchivedSymbols: true });
+  const want = String(symbolName || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const list = res.symbol || res.lightSymbol || [];
+  let exact = null, partial = null;
+  for (const s of list) {
+    const nm = String(s.symbolName || s.name || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (nm === want) { exact = s; break; }
+    if (!partial && nm && want && (nm.indexOf(want) >= 0 || want.indexOf(nm) >= 0)) partial = s;
+  }
+  const hit = exact || partial;
+  return hit ? Number(hit.symbolId) : null;
+}
+async function fetchTrendbars({ clientId, clientSecret, accessToken, ctid, env, symbolName, tf, from, to }) {
+  const period = TB_PERIOD[String(tf)] || TB_PERIOD['15'];
+  const session = new CtSession(env);
+  try {
+    await session.open();
+    await session.appAuth(clientId, clientSecret);
+    session.send(PT.ACCOUNT_AUTH_REQ, { ctidTraderAccountId: Number(ctid), accessToken });
+    await session.wait(PT.ACCOUNT_AUTH_RES);
+    const symbolId = await resolveSymbolId(session, Number(ctid), symbolName);
+    if (!symbolId) throw new Error('Symbol not found on cTrader account: ' + symbolName);
+    const res = await session.request(PT.TRENDBARS_REQ, PT.TRENDBARS_RES, {
+      ctidTraderAccountId: Number(ctid), symbolId, period,
+      fromTimestamp: Number(from), toTimestamp: Number(to),
+    }, 25000);
+    const bars = res.trendbar || [];
+    return bars.map((b) => {
+      const low = Number(b.low || 0);
+      const t = Number(b.utcTimestampInMinutes || 0) * 60;
+      return {
+        time: t,
+        open: (low + Number(b.deltaOpen || 0)) / 1e5,
+        high: (low + Number(b.deltaHigh || 0)) / 1e5,
+        low: low / 1e5,
+        close: (low + Number(b.deltaClose || 0)) / 1e5,
+        volume: Number(b.volume || 0),
+      };
+    }).filter((c) => c.time > 0).sort((a, b) => a.time - b.time);
+  } finally { session.close(); }
+}
+
+module.exports = { fetchClosedTrades, discoverAccounts, mapDeal, fetchTrendbars, PT };

@@ -208,4 +208,20 @@ function friendlyError(e) {
   return 'cTrader connect failed: ' + m;
 }
 
-module.exports = { init, configured, createAuthUrl, handleCallback, disconnect, syncUser, friendlyError };
+// Broker-native candles for one symbol/timeframe/window, using the user's stored
+// cTrader token. Resolves the account env (live/demo) via discoverAccounts so the
+// bars come from the same host the trades were executed on.
+async function getBars(uid, { symbol, tf, from, to, accountId }) {
+  if (!configured()) throw new Error('cTrader is not configured.');
+  const t = await ensureToken(uid);
+  let env = 'live', ctid = accountId;
+  try {
+    const accts = await engine.discoverAccounts({ clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, accessToken: t.accessToken });
+    const match = (accts || []).find((a) => String(a.ctidTraderAccountId) === String(accountId)) || (accts || [])[0];
+    if (match) { env = match.isLive ? 'live' : 'demo'; ctid = match.ctidTraderAccountId; }
+  } catch (e) { /* fall back to the provided accountId on live */ }
+  if (!ctid) throw new Error('No cTrader account resolved for bars.');
+  return engine.fetchTrendbars({ clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, accessToken: t.accessToken, ctid, env, symbolName: symbol, tf, from, to });
+}
+
+module.exports = { init, configured, createAuthUrl, handleCallback, disconnect, syncUser, friendlyError, getBars };
