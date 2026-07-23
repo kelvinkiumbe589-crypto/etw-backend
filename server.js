@@ -182,9 +182,13 @@ app.post('/api/ai/transcribe', aiLimiter, requireAuth, async (req, res) => {
     const ext = mime.indexOf('mp4') >= 0 ? 'mp4' : mime.indexOf('ogg') >= 0 ? 'ogg' : mime.indexOf('wav') >= 0 ? 'wav' : 'webm';
     const form = new FormData();
     form.append('file', new Blob([buf], { type: mime }), 'audio.' + ext);
-    form.append('model', b.model || 'whisper-large-v3-turbo');
+    form.append('model', b.model || 'whisper-large-v3');   // full model = better accuracy than turbo
     form.append('response_format', 'json');
-    if (b.language) form.append('language', String(b.language).slice(0, 8));
+    form.append('temperature', '0');
+    form.append('language', (b.language && /^[a-z]{2}$/i.test(b.language)) ? b.language.toLowerCase() : 'en');
+    // Bias decoding toward trading terms so pairs/jargon transcribe correctly.
+    form.append('prompt', typeof b.prompt === 'string' && b.prompt ? b.prompt.slice(0, 500)
+      : 'Trading journal voice note. Symbols: XAUUSD gold, XAGUSD silver, EURUSD, GBPUSD, USDJPY, GBPJPY, AUDUSD, USDCAD, NAS100, US30, US100, SPX500, GER40, UK100, BTCUSD, ETHUSD. Terms: buy, sell, long, short, entry, exit, stop loss, take profit, lot, pips, profit, loss, breakeven, London, New York, Asian session.');
     const r = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
       method: 'POST',
       headers: { 'Authorization': 'Bearer ' + key }, // let fetch set the multipart boundary
