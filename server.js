@@ -35,6 +35,7 @@ const app = express();
 app.set('trust proxy', 1); // behind Render's proxy — needed for correct client IP in rate limiting
 app.use(cors({ origin: true }));
 app.use('/api/ai/groq', express.json({ limit: '8mb' })); // AI vision payloads (base64 images) exceed 1mb
+app.use('/api/ai/transcribe', express.json({ limit: '25mb' })); // base64 voice audio
 app.use(express.json({ limit: '1mb' }));
 
 // Rate limiters (per-IP) — throttle auth/credential, unauthenticated, and proxy endpoints.
@@ -163,6 +164,36 @@ app.post('/api/ai/groq', aiLimiter, requireAuth, async (req, res) => {
     const data = await r.json().catch(() => ({}));
     res.status(r.status).json(data);
   } catch (e) { console.error('groq proxy:', e.message); res.status(502).json({ error: 'AI upstream error.' }); }
+});
+
+// ── Speech-to-text proxy (Groq Whisper) ────────────────────
+// Accepts base64 audio from the browser (the in-browser Google speech service
+// is blocked on some networks) and returns { text }. Reuses the Groq key.
+app.post('/api/ai/transcribe', aiLimiter, requireAuth, async (req, res) => {
+  const key = process.env.GROQ_API_KEY || '';
+  if (!key) return res.status(503).json({ error: 'AI is not configured on the server.' });
+  const b = req.body || {};
+  if (!b.audio || typeof b.audio !== 'string') return res.status(400).json({ error: 'audio (base64) is required' });
+  try {
+    const buf = Buffer.from(b.audio, 'base64');
+    if (!buf.length) return res.status(400).json({ error: 'empty audio' });
+    if (buf.length > 20 * 1024 * 1024) return res.status(413).json({ error: 'audio too large' });
+    const mime = (b.mime && /^audio\//.test(b.mime)) ? b.mime : 'audio/webm';
+    const ext = mime.indexOf('mp4') >= 0 ? 'mp4' : mime.indexOf('ogg') >= 0 ? 'ogg' : mime.indexOf('wav') >= 0 ? 'wav' : 'webm';
+    const form = new FormData();
+    form.append('file', new Blob([buf], { type: mime }), 'audio.' + ext);
+    form.append('model', b.model || 'whisper-large-v3-turbo');
+    form.append('response_format', 'json');
+    if (b.language) form.append('language', String(b.language).slice(0, 8));
+    const r = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + key }, // let fetch set the multipart boundary
+      body: form,
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) return res.status(r.status).json({ error: (data && data.error && (data.error.message || data.error)) || 'transcription upstream error' });
+    res.json({ text: (data && data.text) || '' });
+  } catch (e) { console.error('transcribe proxy:', e.message); res.status(502).json({ error: 'Transcription upstream error.' }); }
 });
 
 // ── Market-data proxy (Twelve Data) ────────────────────────
